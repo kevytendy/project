@@ -1,18 +1,43 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from opacus.validators import ModuleValidator  # For fixing BatchNorm layers
+import torch.autograd as autograd
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+import os
+from torch.autograd import Variable
+
 
 class VGAN_generator(nn.Module):
     """
     The generator for vanilla GAN.
-    Modified to support dynamic clipping and advanced DP mechanisms.
+    It takes as input a Gaussian noise z and a condition vector c (optional),
+      and produces a "fake" vector x.
+    To this end, it employs multiple fully-connected layers with batch normalization.
     """
 
     def __init__(self, z_dim, hidden_dim, x_dim, layers, col_type, col_ind, condition=False, c_dim=0):
+        """
+        Construct a :class:`VGAN_generator`.
+        Args:
+            * z_dim: the dimension of the Gaussian noise
+            * hidden_dim: the dimension of the hidden layers
+            * x_dim: the dimension of the generated vector
+            * layers: the number of hidden layers
+            * col_type: the representation type of the column
+              - `binary`: binary values, i.e., 0/1
+              - `normalize`: continuous values normalized into [-1, 1]
+              - `one-hot`: categorical values represented as one-hot
+              - `gmm`: continuous values represented by the GMM model
+              - `origin`: the original values in the raw table
+            * condition: a flag indicating whether condition is considered.
+              - the default value is `False`
+            * c_dim: the dimension of the condition vector
+        """
         super(VGAN_generator, self).__init__()
         self.input = nn.Linear(z_dim + c_dim, hidden_dim)
-        self.inputbn = nn.GroupNorm(1, hidden_dim)  # Replaced BatchNorm with GroupNorm
+        self.inputbn = nn.BatchNorm1d(hidden_dim)
         self.hidden = []
         self.BN = []
         self.col_type = col_type
@@ -24,13 +49,21 @@ class VGAN_generator(nn.Module):
             fc = nn.Linear(hidden_dim, hidden_dim)
             setattr(self, "fc%d" % i, fc)
             self.hidden.append(fc)
-            bn = nn.GroupNorm(1, hidden_dim)  # Replaced BatchNorm with GroupNorm
+            bn = nn.BatchNorm1d(hidden_dim)
             setattr(self, "bn%d" % i, bn)
             self.BN.append(bn)
         self.output = nn.Linear(hidden_dim, x_dim)
-        self.outputbn = nn.GroupNorm(1, x_dim)  # Replaced BatchNorm with GroupNorm
+        self.outputbn = nn.BatchNorm1d(x_dim)
 
     def forward(self, z, c=None):
+        """
+        Perform a forward pass of the module.
+        Args:
+            * z: the noise z
+            * c: the condition vector
+        Return:
+            * the fake data vector x
+        """
         if self.condition:
             assert c is not None
             z = torch.cat((z, c), dim=1)
@@ -68,10 +101,23 @@ class VGAN_generator(nn.Module):
 class VGAN_discriminator(nn.Module):
     """
     The discriminator for vanilla GAN.
-    Modified to support dynamic clipping and advanced DP mechanisms.
+    It takes as input the real/fake data,
+      and uses an MLP to produce label (1: real; 0: fake)
     """
 
     def __init__(self, x_dim, hidden_dim, layers, condition=False, c_dim=0, wgan=False):
+        """
+        Construct a :class:VGAN_discriminator
+        Args:
+            * x_dim: dimension of the input real/fake data
+            * hidden_dim: dimension of hidden layers
+            * layers: # of hidden layers
+            * condition: a flag indicating whether condition is considered.
+              - the default value is `False`
+            * c_dim: the dimension of the condition vector
+            * wgan: a flag indicating whether WGAN is used.
+              - the default value is `False`
+        """
         super(VGAN_discriminator, self).__init__()
         self.input = nn.Linear(x_dim + c_dim, hidden_dim)
         self.hidden = []
@@ -85,6 +131,13 @@ class VGAN_discriminator(nn.Module):
         self.output = nn.Linear(hidden_dim, 1)
 
     def forward(self, z, c=None):
+        """
+        Perform a forward pass of the module.
+        Args:
+            * z: the real/fake data
+            * c: the condition vector
+        Return: the predicted label
+        """
         if self.condition:
             assert c is not None
             z = torch.cat((z, c), dim=1)
@@ -97,15 +150,15 @@ class VGAN_discriminator(nn.Module):
             z = self.Dropout(z)
         z = self.output(z)
         if self.wgan:
-            return z
+            return z  # WGAN outputs raw scores
         else:
-            return torch.sigmoid(z)
+            return torch.sigmoid(z)  # Other GANs output probabilities
 
 
 class LSTM_discriminator(nn.Module):
     """
     The discriminator for LSTM-GAN.
-    Modified to support dynamic clipping and advanced DP mechanisms.
+    It uses an LSTM network to process sequential data.
     """
 
     def __init__(self, x_dim, lstm_dim, condition=False, c_dim=0):
@@ -137,10 +190,23 @@ class LSTM_discriminator(nn.Module):
 class LGAN_generator(nn.Module):
     """
     The generator for LSTM-GAN.
-    Modified to support dynamic clipping and advanced DP mechanisms.
+    It takes the columns as a sequence and
+      feeds the sequence into an LSTM network.
     """
 
     def __init__(self, z_dim, feature_dim, lstm_dim, col_dim, col_type, condition=False, c_dim=0):
+        """
+        Construct a :class:LGAN_generator.
+        Args:
+            * z_dim: dimension of the noise
+            * feature_dim: dimension of the feature
+            * lstm_dim: dimension of the LSTM unit
+            * col_dim: a list of column dimensions
+            * col_type: a list of column types
+            * condition: a flag indicating whether condition is considered.
+              - the default value is `False`
+            * c_dim: the dimension of the condition vector
+        """
         super(LGAN_generator, self).__init__()
         self.condition = condition
         self.c_dim = c_dim
@@ -187,6 +253,15 @@ class LGAN_generator(nn.Module):
                 self.Feature[i] = fe
 
     def forward(self, z, c=None):
+        """
+        Perform a forward pass of the module.
+        Args:
+            * z: the noise
+            * c: the condition vector
+        Return:
+        """
+        states = []
+        outputs = []
         if self.condition:
             assert c is not None
             z = torch.cat((z, c), dim=1)
@@ -198,18 +273,19 @@ class LGAN_generator(nn.Module):
             cx = cx.cuda()
             fx = fx.cuda()
         inputs = torch.cat((z, fx), dim=1)
-        outputs = []
         for i in range(len(self.col_type)):
             if self.col_type[i] == "condition":
                 continue
             if self.col_type[i] == "gmm":
                 hx, cx = self.LSTM(inputs, (hx, cx))
+                states.append(hx)
                 fx = torch.tanh(self.Feature[i][0](hx))
                 v = torch.tanh(self.FC[i][0](fx))
                 outputs.append(v)
                 inputs = torch.cat((z, fx), dim=1)
 
                 hx, cx = self.LSTM(inputs, (hx, cx))
+                states.append(hx)
                 fx = torch.tanh(self.Feature[i][1](hx))
                 v = self.FC[i][1](fx)
                 v = torch.softmax(v, dim=1)
@@ -218,6 +294,7 @@ class LGAN_generator(nn.Module):
                 inputs = torch.cat((z, fx), dim=1)
             else:
                 hx, cx = self.LSTM(inputs, (hx, cx))
+                states.append(hx)
                 fx = self.Feature[i](hx)
                 v = self.FC[i][0](fx)
                 if self.col_type[i] == "binary":
@@ -240,22 +317,33 @@ class LGAN_generator(nn.Module):
 class LGAN_discriminator(nn.Module):
     """
     The discriminator of LSTM-GAN.
-    Modified to support dynamic clipping and advanced DP mechanisms.
+    It is very similar to the discriminator of Vanilla GAN.
     """
 
     def __init__(self, x_dim, hidden_dim, num_layers, condition=False, c_dim=0, wgan=False):
+        """
+        Construct a :class:LGAN_discriminator
+            * x_dim: dimension of the real/fake data
+            * hidden_dim: dimension of hidden layers
+            * num_layers: # of hidden layers
+            * condition: a flag indicating whether condition is considered.
+              - the default value is `False`
+            * c_dim: the dimension of the condition vector
+            * wgan: a flag indicating whether WGAN is used.
+              - the default value is `False`
+        """
         super(LGAN_discriminator, self).__init__()
         self.condition = condition
         self.BatchNorm = []
         self.Dropout = nn.Dropout(p=0.5)
         self.FC = []
         self.input = nn.Linear(x_dim + c_dim, hidden_dim)
-        self.inputbn = nn.GroupNorm(1, hidden_dim)  # Replaced BatchNorm with GroupNorm
+        self.inputbn = nn.BatchNorm1d(hidden_dim)
         self.wgan = wgan
         for i in range(num_layers):
             fc = nn.Linear(hidden_dim, hidden_dim)
             setattr(self, "fc%i" % i, fc)
-            bn = nn.GroupNorm(1, hidden_dim)  # Replaced BatchNorm with GroupNorm
+            bn = nn.BatchNorm1d(hidden_dim)
             setattr(self, "bn%i" % i, bn)
             self.BatchNorm.append(bn)
             self.FC.append(fc)
@@ -263,6 +351,14 @@ class LGAN_discriminator(nn.Module):
         self.output = nn.Linear(hidden_dim, 1)
 
     def forward(self, x, c=None):
+        """
+        Perform a forward pass of the module
+        Args:
+            * x: the real/fake data
+            * c: the condition vector
+        Return:
+            * the predicted label
+        """
         if self.condition:
             assert c is not None
             x = torch.cat((x, c), dim=1)
@@ -275,18 +371,27 @@ class LGAN_discriminator(nn.Module):
             x = F.leaky_relu(x)
         x = self.output(x)
         if self.wgan:
-            return x
+            return x  # WGAN outputs raw scores
         else:
-            return torch.sigmoid(x)
+            return torch.sigmoid(x)  # Other GANs output probabilities
 
 
 class DCGAN_generator(nn.Module):
     """
     The generator of DCGAN.
-    Modified to support dynamic clipping and advanced DP mechanisms.
+    It takes as input a noise and
+      outputs the fake data represented as a matrix.
+    To this end, it utilizes the CNN.
     """
 
     def __init__(self, z_dim, shape, kernel, col_type):
+        """
+        Construct a :class:DCGAN_generator
+        * z_dim: dimension of the noise
+        * shape: shape of the output matrix
+        * kernel: kernel size for convolutional layers
+        * col_type: list of column types
+        """
         super(DCGAN_generator, self).__init__()
         in_channal = 4
         out_channal = 1
@@ -297,41 +402,40 @@ class DCGAN_generator(nn.Module):
         self.shape = shape
         self.col_type = col_type
         self.GPU = False
-
-        # Build the generator network
-        while shape > kernel_size:
+        while (shape > kernel_size):
             deconv = nn.ConvTranspose2d(in_channal, out_channal, kernel_size, bias=False)
             setattr(self, "conv%d" % self.layer_num, deconv)
             self.DV.append(deconv)
             if self.layer_num == 0:
                 self.BN.append([])
             else:
-                bn = nn.GroupNorm(1, out_channal)  # Replaced BatchNorm with GroupNorm
+                bn = nn.BatchNorm2d(out_channal)
                 setattr(self, "bn%d" % self.layer_num, bn)
                 self.BN.append(bn)
             out_channal = in_channal
             in_channal = in_channal * 2
             shape = (shape - kernel_size) + 1
             self.layer_num += 1
-
-        # Input layer
         self.input = nn.ConvTranspose2d(z_dim, out_channal, shape, bias=False)
-        self.bn = nn.GroupNorm(1, out_channal)  # Replaced BatchNorm with GroupNorm
+        self.bn = nn.BatchNorm2d(out_channal)
 
     def forward(self, x):
+        """
+        Perform a forward pass of the module
+        Args:
+            * x: the noise
+        Return:
+            * the generated matrix
+        """
         x = x.reshape(x.shape[0], x.shape[1], 1, 1)
         x = self.input(x)
         x = self.bn(x)
         x = F.relu(x)
-
-        # Apply transposed convolutions
         for i in range(len(self.DV) - 1, -1, -1):
             x = self.DV[i](x)
             if i != 0:
                 x = self.BN[i](x)
                 x = F.relu(x)
-
-        # Normalize output according to column type
         for col, t in enumerate(self.col_type):
             i = int(col / self.shape)
             j = col % self.shape
@@ -341,14 +445,13 @@ class DCGAN_generator(nn.Module):
                 x[:, :, i, j] = torch.tanh(x[:, :, i, j])
             else:
                 x[:, :, i, j] = torch.relu(x[:, :, i, j])
-
         return x
 
 
 class DCGAN_discriminator(nn.Module):
     """
     The discriminator of DCGAN.
-    Modified to support dynamic clipping and advanced DP mechanisms.
+    It uses convolutional layers to process the input matrix.
     """
 
     def __init__(self, shape, kernel):
@@ -360,35 +463,33 @@ class DCGAN_discriminator(nn.Module):
         self.BN = []
         self.layer_num = 0
         self.shape = shape
-
-        # Build the discriminator network
-        while shape > kernel_size:
+        while (shape > kernel_size):
             conv = nn.Conv2d(in_channal, out_channal, kernel_size, bias=False)
             setattr(self, "conv%d" % self.layer_num, conv)
             self.CV.append(conv)
-            bn = nn.GroupNorm(1, out_channal)  # Replaced BatchNorm with GroupNorm
+            bn = nn.BatchNorm2d(out_channal)
             setattr(self, "bn%d" % self.layer_num, bn)
             self.BN.append(bn)
             in_channal = out_channal
             out_channal = out_channal * 2
             shape = (shape - kernel_size) + 1
             self.layer_num += 1
-
-        # Output layer
         self.output = nn.Conv2d(in_channal, 1, shape, bias=False)
 
     def forward(self, x):
+        """
+        Perform a forward pass of the module
+        Args:
+            * x: the input matrix
+        Return:
+            * the predicted label
+        """
         x = x.reshape(x.shape[0], 1, self.shape, -1)
-
-        # Apply convolutions
         for i in range(self.layer_num):
             x = self.CV[i](x)
             x = self.BN[i](x)
             x = F.leaky_relu(x)
-
-        # Output layer
         x = self.output(x)
         x = torch.sigmoid(x)
         x = x.reshape(-1, 1)
-
         return x
