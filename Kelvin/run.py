@@ -97,7 +97,8 @@ def thread_run(path, search, config, col_type, dataset, sampleset):
         if dis_model == "lstm":
             dis = LSTM_discriminator(x_dim, param["dis_lstm_dim"], condition, c_dim)
         else:
-            dis = VGAN_discriminator(x_dim, param["dis_hidden_dim"], param["dis_num_layers"], condition, c_dim)
+            dis = VGAN_discriminator(x_dim, param["dis_hidden_dim"], param["dis_num_layers"], condition, c_dim,
+                                     wgan=(train_method in ["WTrain", "CTrain_dp"]))
     elif model == "LGAN":
         gen = LGAN_generator(param["z_dim"], param["gen_feature_dim"], param["gen_lstm_dim"], col_dim, col_type,
                              condition, c_dim)
@@ -105,7 +106,11 @@ def thread_run(path, search, config, col_type, dataset, sampleset):
         if dis_model == "lstm":
             dis = LSTM_discriminator(x_dim, param["dis_lstm_dim"], condition, c_dim)
         else:
-            dis = LGAN_discriminator(x_dim, param["dis_hidden_dim"], param["dis_num_layers"], condition, c_dim)
+            dis = LGAN_discriminator(x_dim, param["dis_hidden_dim"], param["dis_num_layers"], condition, c_dim,
+                                     wgan=(train_method in ["WTrain", "CTrain_dp"]))
+    elif model == "DCGAN":
+        gen = DCGAN_generator(param["z_dim"], dataset.shape, 4, col_type)
+        dis = DCGAN_discriminator(dataset.shape, 4)
 
     GPU = torch.cuda.is_available()
 
